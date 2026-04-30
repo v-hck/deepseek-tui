@@ -1,7 +1,7 @@
 import clipboard from 'clipboardy';
 
 export function copyToClipboard(text) {
-  clipboard.writeSync(text);
+  try { clipboard.writeSync(text); } catch {}
 }
 
 export function readClipboard() {
@@ -9,7 +9,6 @@ export function readClipboard() {
 }
 
 export function extractFilePaths(str) {
-  const pattern = /(?:\/[\w.-]+)+|([A-Za-z]:\\[\w.\\-]+)/g;
-  const matches = str.match(pattern) || [];
+  const matches = str.match(/(?:\/[\w./-]+|[A-Za-z]:\\[\w.\\-]+)/g) || [];
   return [...new Set(matches)];
 }

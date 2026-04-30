@@ -7,259 +7,194 @@ import fs from 'fs';
 
 const TOKEN = process.env.DEEPSEEK_TOKEN;
 if (!TOKEN) {
-  console.error('❌ DEEPSEEK_TOKEN env variable not set.');
+  console.error('❌ Переменная DEEPSEEK_TOKEN не задана.');
   process.exit(1);
 }
 
-// -------------------- Глобальное состояние --------------------
+// ---------- Глобальное состояние ----------
 let screen;
 let currentSessionId = null;
-let messages = [];                // { role, message_id, parent_id, content, thinking_content?, draft? }
+let messages = [];
 let lastAssistantMessageId = null;
-let streamCtrl = null;            // { abort: boolean }
-let regenLock = false;            // Ctrl+E режим перегенерации
-let ignoreResponses = false;      // Alt+S режим игнора ответов
-let thinkingEnabled = false;      // Ctrl+T
-let searchEnabled = true;         // Alt+T
-let attachedFileIds = [];         // id файлов для следующей отправки
+let streamCtrl = null;
+let regenLock = false;
+let ignoreResponses = false;
+let thinkingEnabled = false;
+let searchEnabled = true;
+let attachedFileIds = [];
+let sessionTitle = '';
 
-// -------------------- Хелперы --------------------
-function escapeBlessed(text) {
-  return text.replace(/\{/g, '\\{').replace(/\}/g, '\\}');
-}
+// ---------- Элементы UI ----------
+let sessionList, chatLog, inputBox, thinkingBox, statusBar;
 
-function formatMessage(msg, idx) {
-  const role = msg.role === 'USER' ? 'Вы' : 'DeepSeek';
-  const idStr = msg.message_id ? `#${msg.message_id}` : '';
-  let body = '';
-  if (msg.thinking_content) {
-    body += `{yellow-fg}[Думал ${msg.thinking_elapsed_secs?.toFixed(2) || '?'}c]{/yellow-fg}\n`;
-  }
-  body += mdToBlessed(msg.content || '');
-  return `{bold}${role}${idStr}{/bold}\n${body}`;
-}
-
-function buildChatLogContent() {
-  return messages.map(formatMessage).join('\n');
-}
-
-function updateChatLog() {
-  chatLog.setContent(buildChatLogContent());
-  chatLog.setScrollPerc(100);
+// ---------- Вспомогательные функции ----------
+function showError(msg) {
+  console.error(`${msg}`)
+  const errBox = blessed.message({
+    parent: screen,
+    top: 'center', left: 'center', width: '50%', height: '20%',
+    border: { type: 'line' },
+    style: { border: { fg: 'red' } },
+    label: ' Ошибка ',
+    content: msg,
+  });
+  setTimeout(() => { errBox.destroy(); screen.render(); }, 3000);
   screen.render();
 }
 
-function updateStatus() {
-  const parts = [];
-  if (regenLock) parts.push('{bold}REGEN{/bold}');
-  if (ignoreResponses) parts.push('{bold}NO-RESP{/bold}');
-  if (thinkingEnabled) parts.push('💭');
-  if (searchEnabled) parts.push('🔍');
-  if (attachedFileIds.length) parts.push(`📎${attachedFileIds.length}`);
-  parts.push('Ctrl+Q Exit');
-  statusBar.setContent(parts.join(' | '));
-  screen.render();
-}
-
-// -------------------- API взаимодействие --------------------
-async function sendMessage(prompt, parentMsgId = null) {
-  if (!currentSessionId) return;
-  // Добавляем сообщение пользователя в историю
-  const userMsg = { role: 'USER', content: prompt, message_id: null, parent_id: parentMsgId };
-  messages.push(userMsg);
-  updateChatLog();
-
-  if (ignoreResponses) {
-    // Просто добавили сообщение пользователя и всё
-    return;
-  }
-
-  // Подготовка file_ids
-  const fileIds = [...attachedFileIds];
-  attachedFileIds = [];
-  updateStatus();
-
-  // Создаём запись-заглушку для ответа
-  const assistantMsg = { role: 'ASSISTANT', content: '', message_id: null, thinking_content: '', draft: true };
-  messages.push(assistantMsg);
-  const assistantIdx = messages.length - 1;
-
-  thinkingBox.show();
-  screen.render();
-
-  streamCtrl = { abort: false };
-  let thinkingText = '';
-  let answerText = '';
-  let newMessageId = null;
+async function initCore() {
   try {
-    for await (const chunk of core.completion(TOKEN, prompt, currentSessionId, parentMsgId, {
-      search: searchEnabled,
-      thinking: thinkingEnabled,
-      file_ids: fileIds,
-    })) {
-      if (streamCtrl.abort) break;
-      if (chunk.type === 'thinking') {
-        thinkingText += chunk.content;
-        thinkingBox.setContent(thinkingText);
-        messages[assistantIdx].thinking_content = thinkingText;
-        updateChatLog();
-      } else if (chunk.type === 'text') {
-        answerText += chunk.content;
-        messages[assistantIdx].content = answerText;
-        updateChatLog();
-        if (chunk.message_id) newMessageId = chunk.message_id;
-      } else if (chunk.type === 'searching') {
-        messages[assistantIdx].content = '🔍 Ищу...';
-        updateChatLog();
-      }
-    }
+    // Тестовая инициализация wasm
+    await core.solvePow('test', '0', Date.now()+10000, 0);
   } catch (e) {
-    messages[assistantIdx].content = `❌ Ошибка: ${e.message}`;
-  }
-
-  streamCtrl = null;
-  messages[assistantIdx].draft = false;
-  if (newMessageId) messages[assistantIdx].message_id = newMessageId;
-  lastAssistantMessageId = newMessageId;
-  thinkingBox.hide();
-  updateChatLog();
-  screen.render();
-
-  // Если режим перегенерации: после получения ответа вновь включаем ожидание ввода
-  if (regenLock) {
-    inputBox.focus();
+    throw e;
   }
 }
 
-async function stopCurrentStream() {
-  if (streamCtrl) {
-    streamCtrl.abort = true;
-    if (lastAssistantMessageId && currentSessionId) {
-      await core.stopStream(TOKEN, currentSessionId, lastAssistantMessageId);
-    }
-  }
-}
-
-// -------------------- Модальные окна --------------------
-function showSessionSelector() {
-  // Удаляем все элементы экрана
+// ---------- Селектор сессий ----------
+async function showSessionSelector() {
+  // Уничтожаем все дочерние элементы
   screen.children.forEach(c => c.destroy());
-  // Создаём новый layout
-  createSelectorUI();
-}
 
-function createSelectorUI() {
-  const list = blessed.list({
+  sessionList = blessed.list({
     parent: screen,
     top: 2, left: 2, width: '96%', height: '90%',
     border: { type: 'line' },
     style: { selected: { bg: 'red' }, border: { fg: 'red' } },
-    keys: true, vi: true,
-    label: ' Чат сессии ',
-  });
-
-  const cmdInput = blessed.textbox({
-    parent: screen,
-    bottom: 0, left: 2, width: '96%', height: 3,
-    border: { type: 'line' },
-    style: { border: { fg: 'red' } },
-    inputOnFocus: true,
-    label: ' Команды: d N удалить, r N имя создать/переименовать, имя создать ',
+    keys: true,
+    vi: true,
+    label: ' Чат сессии (стрелки, Enter/Пробел — выбрать, e — переименовать, d — удалить, D — удалить без подтверждения) ',
   });
 
   let sessions = [];
 
   async function loadSessions() {
     const data = await core.fetchAllChatSessions(TOKEN);
-    sessions = data?.data?.biz_data?.chat_sessions || [];
+    if (!data?.data?.biz_data?.chat_sessions) {
+      showError('Не удалось загрузить сессии.');
+      return;
+    }
+    sessions = data.data.biz_data.chat_sessions;
     refreshList();
   }
 
   function refreshList() {
-    list.setItems(sessions.map((s, i) => `[${i + 1}] ${s.title || '(untitled)'}`).concat(['[+] Новый чат']));
+    sessionList.setItems(
+      sessions.map(s => `[${s.title || 'без названия'}]`).concat(['[+] Новый чат'])
+    );
     screen.render();
   }
 
-  list.on('select', async (item, index) => {
+  sessionList.on('select', async (item, index) => {
     if (index === sessions.length) {
+      // Создать новый
       const newChat = await core.createChatSession(TOKEN);
       if (newChat?.data?.biz_data?.id) {
         currentSessionId = newChat.data.biz_data.id;
+        sessionTitle = 'Новый чат';
         messages = [];
+        screen.children.forEach(c => c.destroy());
+        showChat();
       }
-      screen.children.forEach(c => c.destroy());
-      createChatUI();
     } else {
       currentSessionId = sessions[index].id;
+      sessionTitle = sessions[index].title || 'Без названия';
       const hist = await core.fetchHistoryMessages(TOKEN, currentSessionId);
       messages = hist?.data?.biz_data?.chat_messages || [];
       screen.children.forEach(c => c.destroy());
-      createChatUI();
-      updateChatLog();
+      showChat();
     }
   });
 
-  cmdInput.key('enter', async () => {
-    const val = cmdInput.getValue().trim();
-    cmdInput.clearValue();
-    if (/^d\s+\d+$/.test(val)) {
-      const idx = parseInt(val.split(/\s+/)[1]) - 1;
-      if (idx >= 0 && idx < sessions.length) {
-        await core.deleteChatSession(TOKEN, sessions[idx].id);
-        sessions.splice(idx, 1);
-        refreshList();
-      }
-    } else if (/^r\s+\d+\s+.+$/.test(val)) {
-      const parts = val.split(/\s+/);
-      const idx = parseInt(parts[1]) - 1;
-      const newTitle = parts.slice(2).join(' ');
-      if (idx >= 0 && idx < sessions.length) {
-        await core.updateChatTitle(TOKEN, sessions[idx].id, newTitle);
-        sessions[idx].title = newTitle;
-        refreshList();
-      }
-    } else if (val) {
-      const newChat = await core.createChatSession(TOKEN);
-      if (newChat?.data?.biz_data?.id) {
-        currentSessionId = newChat.data.biz_data.id;
-        await core.updateChatTitle(TOKEN, currentSessionId, val);
-        messages = [];
-        screen.children.forEach(c => c.destroy());
-        createChatUI();
-      }
+  // Клавиши для селектора
+  sessionList.key('e', async () => {
+    const idx = sessionList.selected;
+    if (idx >= sessions.length) return;
+    const prompt = blessed.prompt({
+      parent: screen,
+      top: 'center', left: 'center', width: '40%', height: 5,
+      border: { type: 'line' },
+      style: { border: { fg: 'red' } },
+    });
+    const newName = await prompt.input('Новое имя', sessions[idx].title || '');
+    if (newName) {
+      await core.updateChatTitle(TOKEN, sessions[idx].id, newName);
+      sessions[idx].title = newName;
+      refreshList();
     }
+    sessionList.focus();
     screen.render();
   });
 
-  cmdInput.focus();
+  sessionList.key('d', async () => {
+    const idx = sessionList.selected;
+    if (idx >= sessions.length) return;
+    const prompt = blessed.prompt({
+      parent: screen,
+      top: 'center', left: 'center', width: '40%', height: 5,
+      border: { type: 'line' },
+      style: { border: { fg: 'red' } },
+    });
+    const confirm = await prompt.input('Введите "yes" для удаления', '');
+    if (confirm?.toLowerCase() === 'yes') {
+      // Сохраняем историю перед удалением
+      const hist = await core.fetchHistoryMessages(TOKEN, sessions[idx].id);
+      if (hist?.data?.biz_data?.chat_messages) {
+        core.saveHistoryToFile(hist.data.biz_data.chat_messages, sessions[idx].title);
+      }
+      await core.deleteChatSession(TOKEN, sessions[idx].id);
+      sessions.splice(idx, 1);
+      refreshList();
+    }
+    sessionList.focus();
+    screen.render();
+  });
+
+  sessionList.key('D', async () => {
+    const idx = sessionList.selected;
+    if (idx >= sessions.length) return;
+    // Сохраняем историю
+    const hist = await core.fetchHistoryMessages(TOKEN, sessions[idx].id);
+    if (hist?.data?.biz_data?.chat_messages) {
+      core.saveHistoryToFile(hist.data.biz_data.chat_messages, sessions[idx].title);
+    }
+    await core.deleteChatSession(TOKEN, sessions[idx].id);
+    sessions.splice(idx, 1);
+    refreshList();
+    sessionList.focus();
+    screen.render();
+  });
+
+  sessionList.key('escape', () => process.exit(0));
+  sessionList.focus();
   screen.render();
-  loadSessions();
+  await loadSessions();
 }
 
-// -------------------- UI чата --------------------
-let chatLog, inputBox, thinkingBox, statusBar;
-
-function createChatUI() {
-  chatLog = blessed.log({
+// ---------- Чат ----------
+function showChat() {
+  chatLog = blessed.box({
     parent: screen,
     top: 0, left: 0, width: '100%', height: '90%',
     tags: true,
     scrollable: true,
     scrollbar: { ch: ' ' },
     keys: true,
-    vi: true,
+    mouse: true,
     border: { type: 'line' },
     style: { border: { fg: 'red' } },
-    label: ' DeepTerm Chat ',
+    label: ` ${sessionTitle} `,
+    content: '',
   });
 
-  thinkingBox = blessed.log({
+  thinkingBox = blessed.box({
     parent: screen,
-    top: 0, left: 0, width: '100%', height: '30%',
+    top: 0, left: 0, width: '100%', height: '25%',
     hidden: true,
     border: { type: 'line' },
     style: { border: { fg: 'yellow' } },
     label: ' 💭 Мышление ',
+    content: '',
   });
 
   inputBox = blessed.textbox({
@@ -277,71 +212,154 @@ function createChatUI() {
     bottom: 0, left: 0, width: '100%', height: 1,
     tags: true,
     style: { bg: 'red', fg: 'black' },
-    content: '',
+    content: ' Ctrl+Q выход | Ctrl+E реген | Ctrl+S стоп | Alt+S игнор | Ctrl+C копировать блок | Alt+C копировать сообщение | Ctrl+T мышление | Alt+T поиск | Tab фокус ввода | ↑↓ скролл ',
   });
 
-  inputBox.focus();
-  updateStatus();
-  setupChatKeybindings();
-  screen.render();
-}
+  // Перемещение фокуса по Tab
+  screen.key('tab', () => {
+    if (screen.focused === chatLog) inputBox.focus();
+    else chatLog.focus();
+    screen.render();
+  });
 
-function setupChatKeybindings() {
-  // Глобальные клавиши для чата
-  screen.removeAllListeners('keypress');
-  screen.key(['C-q', 'escape'], () => {
-    // Выход в меню выбора сессий
+  // Клик мыши на поле ввода
+  inputBox.on('click', () => {
+    inputBox.focus();
+    screen.render();
+  });
+
+  chatLog.on('wheelup', () => {
+    chatLog.scroll(-1);
+    screen.render();
+  });
+  chatLog.on('wheeldown', () => {
+    chatLog.scroll(1);
+    screen.render();
+  });
+
+  // Стрелки вверх/вниз скроллят чат (когда в фокусе)
+  chatLog.key('up', () => { chatLog.scroll(-1); screen.render(); });
+  chatLog.key('down', () => { chatLog.scroll(1); screen.render(); });
+
+  // Глобальные хоткеи
+  screen.key(['C-q'], () => {
     showSessionSelector();
   });
 
-  // Ctrl+e – лок перегенерации
   screen.key('C-e', () => {
     regenLock = !regenLock;
     updateStatus();
   });
 
-  // Alt+e – редактирование сообщения по номеру
-  screen.key('M-e', () => {
-    promptEditMessage();
+  screen.key('M-e', async () => {
+    // Редактирование сообщения
+    const prompt = blessed.prompt({
+      parent: screen,
+      top: 'center', left: 'center', width: '30%', height: 5,
+      border: { type: 'line' },
+    });
+    const numStr = await prompt.input('message_id для редактирования', '');
+    if (!numStr) return;
+    const msgId = parseInt(numStr);
+    const msg = messages.find(m => m.message_id === msgId && m.role === 'USER');
+    if (!msg) return;
+    const editBox = blessed.textbox({
+      parent: screen,
+      top: 'center', left: 'center', width: '80%', height: 10,
+      border: { type: 'line' },
+      inputOnFocus: true,
+      label: ' Редактировать (Enter отправить, Esc отмена) ',
+    });
+    editBox.setValue(msg.content);
+    editBox.focus();
+    screen.render();
+    editBox.key('enter', () => {
+      const newText = editBox.getValue().trim();
+      editBox.destroy();
+      const idx = messages.indexOf(msg);
+      if (idx >= 0) {
+        messages.splice(idx + 1);
+        messages[idx].content = newText;
+        updateChatLog();
+        const parent = msg.parent_id || (idx > 0 ? messages[idx - 1]?.message_id : null);
+        sendMessage(newText, parent);
+      }
+    });
+    editBox.key('escape', () => { editBox.destroy(); screen.render(); });
   });
 
-  // Ctrl+s – пауза стрима
   screen.key('C-s', async () => {
     await stopCurrentStream();
   });
 
-  // Alt+s – игнор ответов
   screen.key('M-s', () => {
     ignoreResponses = !ignoreResponses;
     updateStatus();
   });
 
-  // Ctrl+c – копирование кодового блока
   screen.key('C-c', () => {
-    promptCopyBlock();
+    // Копировать блок
+    const lastMsg = [...messages].reverse().find(m => m.role === 'ASSISTANT');
+    if (!lastMsg) return;
+    const blocks = [...lastMsg.content.matchAll(/```([\s\S]*?)```/g)].map(m => m[1]);
+    if (blocks.length === 0) {
+      copyToClipboard(lastMsg.content);
+      return;
+    }
+    if (blocks.length === 1) {
+      copyToClipboard(blocks[0]);
+      return;
+    }
+    // Показать выбор
+    const choices = blessed.list({
+      parent: screen,
+      top: 'center', left: 'center', width: '50%', height: '30%',
+      border: { type: 'line' },
+      items: blocks.map((b, i) => `[${i + 1}] ${b.slice(0, 40).replace(/\n/g, ' ')}...`),
+      style: { selected: { bg: 'red' } },
+      keys: true,
+    });
+    choices.focus();
+    choices.on('select', (_, i) => {
+      copyToClipboard(blocks[i]);
+      choices.destroy();
+      screen.render();
+    });
+    choices.key('escape', () => { choices.destroy(); screen.render(); });
+    screen.render();
   });
 
-  // Alt+c – копирование сообщения
   screen.key('M-c', () => {
-    promptCopyMessage();
+    const prompt = blessed.prompt({
+      parent: screen,
+      top: 'center', left: 'center', width: '30%', height: 5,
+      border: { type: 'line' },
+    });
+    prompt.input('message_id или Enter для последнего', '', (err, value) => {
+      const num = parseInt(value?.trim());
+      let msg;
+      if (isNaN(num)) msg = messages[messages.length - 1];
+      else msg = messages.find(m => m.message_id === num);
+      if (msg) copyToClipboard(msg.content);
+      screen.render();
+    });
   });
 
-  // Ctrl+t – тогл мышления
   screen.key('C-t', () => {
     thinkingEnabled = !thinkingEnabled;
     updateStatus();
   });
 
-  // Alt+t – тогл поиска
   screen.key('M-t', () => {
     searchEnabled = !searchEnabled;
     updateStatus();
   });
 
-  // Ctrl+v – добавить файлы из буфера обмена
   screen.key('C-v', async () => {
     const clip = readClipboard();
-    const paths = extractFilePaths(clip).filter(p => fs.existsSync(p));
+    const paths = extractFilePaths(clip).filter(p => {
+      try { return fs.existsSync(p); } catch { return false; }
+    });
     if (paths.length) {
       const ids = [];
       for (const p of paths) {
@@ -356,145 +374,165 @@ function setupChatKeybindings() {
     screen.render();
   });
 
-  // Alt+v – raw вставка из буфера
   screen.key('M-v', () => {
     const clip = readClipboard();
     inputBox.setValue(clip);
     screen.render();
   });
 
-  // Enter – отправка сообщения
+  // Отправка сообщения
   inputBox.key('enter', async () => {
     const text = inputBox.getValue().trim();
     if (!text) return;
     inputBox.clearValue();
     let parent = null;
     if (regenLock) {
-      // Перегенерация: находим последний ответ ассистента и удаляем его,
-      // затем ищем предыдущее сообщение пользователя и берём его parent.
-      const lastAssistantIdx = messages.map(m => m.role).lastIndexOf('ASSISTANT');
-      if (lastAssistantIdx >= 0) {
-        // Удаляем последний ответ ассистента
-        messages.splice(lastAssistantIdx, 1);
-        // Ищем сообщение пользователя, на которое был этот ответ
+      // Перегенерация последнего ответа
+      const lastAsIdx = messages.map(m => m.role).lastIndexOf('ASSISTANT');
+      if (lastAsIdx >= 0) {
+        messages.splice(lastAsIdx, 1);
         const lastUserIdx = messages.map(m => m.role).lastIndexOf('USER');
         if (lastUserIdx >= 0) {
           parent = messages[lastUserIdx].message_id || null;
         }
       }
-      // Добавляем новый запрос пользователя (заменяет старый?)
-      // По логике перегенерации мы не должны добавлять новое сообщение пользователя,
-      // а отправить тот же самый запрос. Поэтому просто используем найденный parent
-      // и не добавляем userMsg.
-      // Но если текст изменился, нужно добавить. Упростим: всегда добавляем новый USER
-      // с новым текстом и тем же parent, а старый ответ уже удалён.
       messages.push({ role: 'USER', content: text, message_id: null, parent_id: parent });
       updateChatLog();
       await sendMessage(text, parent);
     } else {
-      // Обычный режим
       await sendMessage(text, null);
     }
     inputBox.focus();
   });
+
+  // Начальная отрисовка истории
+  updateChatLog();
+  inputBox.focus();
+  screen.render();
 }
 
-// -------------------- Вспомогательные диалоги --------------------
-async function promptEditMessage() {
-  // Запрашиваем номер сообщения
-  const prompt = blessed.prompt({
-    parent: screen,
-    top: 'center', left: 'center', width: '30%', height: 5,
-    border: { type: 'line' },
-    style: { border: { fg: 'red' } },
-  });
-  const numStr = await prompt.input('Номер сообщения (message_id)', '');
-  if (!numStr) return;
-  const msgId = parseInt(numStr);
-  const msg = messages.find(m => m.message_id === msgId && m.role === 'USER');
-  if (!msg) return;
-  // Показываем текст для редактирования
-  const editBox = blessed.textbox({
-    parent: screen,
-    top: 'center', left: 'center', width: '80%', height: 10,
-    border: { type: 'line' },
-    style: { border: { fg: 'red' } },
-    inputOnFocus: true,
-    label: ' Редактирование (Enter отправить, Esc отмена) ',
-  });
-  editBox.setValue(msg.content);
-  editBox.focus();
+// ---------- Обновление UI ----------
+function formatMessage(msg) {
+  const role = msg.role === 'USER' ? 'Вы' : 'DeepSeek';
+  const idStr = msg.message_id ? ` #${msg.message_id}` : '';
+
+  // Извлекаем текст из fragments
+  let raw = '';
+  if (Array.isArray(msg.fragments)) {
+    raw = msg.fragments
+      .filter(f => f.content && (f.type === 'REQUEST' || f.type === 'RESPONSE'))
+      .map(f => f.content)
+      .join('\n');
+  } else if (typeof msg.content === 'string') {
+    raw = msg.content; // fallback на старый формат
+  }
+
+  let body = '';
+  if (msg.thinking_content) {
+    const elapsed = msg.thinking_elapsed_secs?.toFixed(2) || '?';
+    body += `{yellow-fg}[Думал ${elapsed}с]{/yellow-fg}\n`;
+  }
+  body += mdToBlessed(raw);
+  return `{bold}${role}${idStr}{/bold}\n${body}\n`;
+}
+
+function updateChatLog() {
+  chatLog.setContent(messages.map(formatMessage).join(''));
+  chatLog.setScrollPerc(100);
   screen.render();
-  return new Promise(resolve => {
-    editBox.key('enter', () => {
-      const newText = editBox.getValue().trim();
-      editBox.destroy();
-      // Удаляем все сообщения после этого (включая ответы)
-      const idx = messages.indexOf(msg);
-      if (idx >= 0) {
-        messages.splice(idx + 1);
-        messages[idx].content = newText;
+}
+
+function updateStatus() {
+  const parts = [];
+  if (regenLock) parts.push('REGEN');
+  if (ignoreResponses) parts.push('NO-RESP');
+  if (thinkingEnabled) parts.push('THINK');
+  if (searchEnabled) parts.push('SEARCH');
+  if (attachedFileIds.length) parts.push(`FILES:${attachedFileIds.length}`);
+  statusBar.setContent(parts.join(' | ') + ' | Ctrl+Q выход | Ctrl+E реген | Ctrl+S стоп | Alt+S игнор | Ctrl+C копировать блок | Alt+C копировать сообщение | Ctrl+T мышление | Alt+T поиск | Tab фокус ввода | ↑↓ скролл ');
+  screen.render();
+}
+
+async function sendMessage(prompt, parentMsgId = null) {
+  if (!currentSessionId) return;
+  const userMsg = { role: 'USER', content: prompt, message_id: null, parent_id: parentMsgId };
+  messages.push(userMsg);
+  updateChatLog();
+
+  if (ignoreResponses) return;
+
+  const fileIds = [...attachedFileIds];
+  attachedFileIds = [];
+  updateStatus();
+
+  const assistantMsg = { role: 'ASSISTANT', content: '', message_id: null, thinking_content: '', draft: true };
+  messages.push(assistantMsg);
+  const assistantIdx = messages.length - 1;
+
+  thinkingBox.show();
+  screen.render();
+
+  streamCtrl = { abort: false };
+  let thinkingText = '';
+  let answerText = '';
+  let newMessageId = null;
+
+  try {
+    const generator = core.completion(TOKEN, prompt, currentSessionId, parentMsgId, {
+      search: searchEnabled,
+      thinking: thinkingEnabled,
+      file_ids: fileIds,
+    });
+
+    for await (const chunk of generator) {
+      if (streamCtrl.abort) break;
+      if (chunk.type === 'thinking') {
+        thinkingText += chunk.content;
+        thinkingBox.setContent(thinkingText);
+        messages[assistantIdx].thinking_content = thinkingText;
         updateChatLog();
-        // Отправляем перегенерацию
-        const parent = msg.parent_id || (idx > 0 ? messages[idx - 1]?.message_id : null);
-        sendMessage(newText, parent);
+      } else if (chunk.type === 'text') {
+        answerText += chunk.content;
+        messages[assistantIdx].content = answerText;
+        if (chunk.message_id) newMessageId = chunk.message_id;
+        updateChatLog();
+      } else if (chunk.type === 'searching') {
+        messages[assistantIdx].content = '🔍 Поиск...';
+        updateChatLog();
       }
-      resolve();
-    });
-    editBox.key('escape', () => {
-      editBox.destroy();
-      screen.render();
-      resolve();
-    });
-  });
-}
+    }
+  } catch (e) {
+	console.error(`${e.message}`)
+    messages[assistantIdx].content = `❌ Ошибка: ${e.message}`;
+  }
 
-function promptCopyBlock() {
-  const lastMsg = [...messages].reverse().find(m => m.role === 'ASSISTANT');
-  if (!lastMsg) return;
-  const blocks = [...lastMsg.content.matchAll(/```([\s\S]*?)```/g)].map(m => m[1]);
-  if (blocks.length === 0) { copyToClipboard(lastMsg.content); return; }
-  if (blocks.length === 1) { copyToClipboard(blocks[0]); return; }
-  // Показываем выбор
-  const list = blessed.list({
-    parent: screen,
-    top: 'center', left: 'center', width: '50%', height: '30%',
-    border: { type: 'line' },
-    items: blocks.map((b, i) => `[${i + 1}] ${b.slice(0, 40).replace(/\n/g, ' ')}...`),
-    style: { selected: { bg: 'red' } },
-    keys: true, vi: true,
-  });
-  list.focus();
-  list.on('select', (_, idx) => {
-    copyToClipboard(blocks[idx]);
-    list.destroy();
-    screen.render();
-  });
-  list.key('escape', () => { list.destroy(); screen.render(); });
+  streamCtrl = null;
+  messages[assistantIdx].draft = false;
+  if (newMessageId) messages[assistantIdx].message_id = newMessageId;
+  lastAssistantMessageId = newMessageId;
+  thinkingBox.hide();
+  updateChatLog();
   screen.render();
 }
 
-function promptCopyMessage() {
-  const prompt = blessed.prompt({
-    parent: screen,
-    top: 'center', left: 'center', width: '30%', height: 5,
-    border: { type: 'line' },
-  });
-  prompt.input('Номер сообщения (Enter для последнего)', '', (err, value) => {
-    const num = parseInt(value?.trim());
-    let msg;
-    if (isNaN(num)) {
-      msg = messages[messages.length - 1];
-    } else {
-      msg = messages.find(m => m.message_id === num);
+async function stopCurrentStream() {
+  if (streamCtrl) {
+    streamCtrl.abort = true;
+    if (lastAssistantMessageId && currentSessionId) {
+      await core.stopStream(TOKEN, currentSessionId, lastAssistantMessageId);
     }
-    if (msg) copyToClipboard(msg.content);
-    screen.render();
-  });
+  }
 }
 
-// -------------------- Старт --------------------
+// ---------- Entry point ----------
 screen = blessed.screen({ smartCSR: true, title: 'DeepTerm' });
-screen.key(['C-q'], () => process.exit(0)); // глобальный выход на Ctrl+Q
 
-showSessionSelector();
+(async () => {
+  try {
+    await initCore();
+    await showSessionSelector();
+  } catch (e) {
+	console.error(`${e.message}`)
+    process.exit(1);
+  }
+})();

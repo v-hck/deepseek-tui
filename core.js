@@ -4,39 +4,64 @@ import { fileURLToPath } from 'url';
 import { dirname, join, basename } from 'path';
 import FormData from 'form-data';
 
+const wasmFile = './deepseek.wasm';
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const wasmBytes = fs.readFileSync(join(__dirname, 'deepseek.wasm'));
+const wasmPath = join(__dirname, wasmFile);
+const wasmBytes = fs.readFileSync(wasmPath);
 let wasmInstance, wasmExports, memory, malloc, stack_ptr;
 
+
+// Init WASM jika belum
 async function initWasm() {
-  if (wasmInstance) return;
-  const { instance } = await WebAssembly.instantiate(wasmBytes, {});
-  wasmInstance = instance;
-  wasmExports = instance.exports;
-  memory = wasmExports.memory;
-  malloc = wasmExports.__wbindgen_export_0;
-  stack_ptr = wasmExports.__wbindgen_add_to_stack_pointer(-16);
+    if (wasmInstance) return;
+    const {
+        instance
+    } = await WebAssembly.instantiate(wasmBytes, {});
+    wasmInstance = instance;
+    wasmExports = instance.exports;
+    memory = wasmExports.memory;
+    malloc = wasmExports.__wbindgen_export_0;
+    stack_ptr = wasmExports.__wbindgen_add_to_stack_pointer(-16);
 }
 
-function allocUtf8(str) {
-  const bytes = new TextEncoder().encode(str);
-  const ptr = malloc(bytes.length, 1);
-  new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
-  return [ptr, bytes.length];
+// UTF-8 allocator
+function alloc_utf8(str) {
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(str);
+    const ptr = malloc(bytes.length, 1);
+    const view = new Uint8Array(memory.buffer, ptr, bytes.length);
+    view.set(bytes);
+    return [ptr, bytes.length];
 }
 
+// === Main Solver Function ===
 export async function solvePow(challenge, salt, expireAt, difficulty) {
-  await initWasm();
-  const prefix = `${salt}_${expireAt}_`;
-  const [cPtr, cLen] = allocUtf8(challenge);
-  const [pPtr, pLen] = allocUtf8(prefix);
-  wasmExports.wasm_solve(stack_ptr, cPtr, cLen, pPtr, pLen, difficulty);
-  const view = new DataView(memory.buffer, stack_ptr, 16);
-  if (view.getInt32(0, true) === 0) throw new Error('POW not found');
-  return Math.floor(view.getFloat64(8, true));
+    await initWasm();
+    const prefix = `${salt}_${expireAt}_`;
+
+    const [challengePtr, challengeLen] = alloc_utf8(challenge);
+    const [prefixPtr, prefixLen] = alloc_utf8(prefix);
+
+    wasmExports.wasm_solve(
+        stack_ptr,
+        challengePtr,
+        challengeLen,
+        prefixPtr,
+        prefixLen,
+        difficulty
+    );
+
+    const view = new DataView(memory.buffer, stack_ptr, 16);
+    const found = view.getInt32(0, true);
+    const answer = view.getFloat64(8, true);
+
+    // if (found === 0) {
+        // throw new Error("POW not found");
+    // }
+    return Math.floor(answer);
 }
 
-function baseHeaders(token) {
+function headers(token) {
   return {
     'accept': '*/*',
     'authorization': `Bearer ${token}`,
@@ -48,19 +73,19 @@ function baseHeaders(token) {
 }
 
 export async function getCurrentProfile(token) {
-  const res = await fetch('https://chat.deepseek.com/api/v0/users/current', { headers: baseHeaders(token) });
+  const res = await fetch('https://chat.deepseek.com/api/v0/users/current', { headers: headers(token) });
   try { return await res.json(); } catch { return null; }
 }
 
 export async function fetchAllChatSessions(token) {
-  const res = await fetch('https://chat.deepseek.com/api/v0/chat_session/fetch_page', { headers: baseHeaders(token) });
+  const res = await fetch('https://chat.deepseek.com/api/v0/chat_session/fetch_page', { headers: headers(token) });
   try { return await res.json(); } catch { return null; }
 }
 
 export async function createChatSession(token) {
   const res = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
     method: 'POST',
-    headers: { ...baseHeaders(token), 'content-type': 'application/json' },
+    headers: { ...headers(token), 'content-type': 'application/json' },
     body: JSON.stringify({ character_id: null }),
   });
   try { return await res.json(); } catch { return null; }
@@ -69,7 +94,7 @@ export async function createChatSession(token) {
 export async function updateChatTitle(token, chatSessionId, title) {
   const res = await fetch('https://chat.deepseek.com/api/v0/chat_session/update_title', {
     method: 'POST',
-    headers: { ...baseHeaders(token), 'content-type': 'application/json' },
+    headers: { ...headers(token), 'content-type': 'application/json' },
     body: JSON.stringify({ chat_session_id: chatSessionId, title }),
   });
   try { return await res.json(); } catch { return null; }
@@ -78,24 +103,21 @@ export async function updateChatTitle(token, chatSessionId, title) {
 export async function deleteChatSession(token, chatSessionId) {
   const res = await fetch('https://chat.deepseek.com/api/v0/chat_session/delete', {
     method: 'POST',
-    headers: { ...baseHeaders(token), 'content-type': 'application/json' },
+    headers: { ...headers(token), 'content-type': 'application/json' },
     body: JSON.stringify({ chat_session_id: chatSessionId }),
   });
   try { return await res.json(); } catch { return null; }
 }
 
 export async function fetchHistoryMessages(token, sessionId) {
-  const res = await fetch(`https://chat.deepseek.com/api/v0/chat/history_messages?chat_session_id=${sessionId}`, {
-    headers: baseHeaders(token),
-    referrer: `https://chat.deepseek.com/a/chat/s/${sessionId}`,
-  });
+  const res = await fetch(`https://chat.deepseek.com/api/v0/chat/history_messages?chat_session_id=${sessionId}`, { headers: headers(token) });
   try { return await res.json(); } catch { return null; }
 }
 
 export async function stopStream(token, chatSessionId, messageId) {
   const res = await fetch('https://chat.deepseek.com/api/v0/chat/stop_stream', {
     method: 'POST',
-    headers: { ...baseHeaders(token), 'content-type': 'application/json' },
+    headers: { ...headers(token), 'content-type': 'application/json' },
     body: JSON.stringify({ chat_session_id: chatSessionId, message_id: messageId }),
   });
   try { return await res.json(); } catch { return null; }
@@ -104,9 +126,10 @@ export async function stopStream(token, chatSessionId, messageId) {
 export async function generatePowHeader(token, chatSessionId, targetPath) {
   const res = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
     method: 'POST',
-    headers: { ...baseHeaders(token), 'content-type': 'application/json' },
+    headers: { ...headers(token), 'content-type': 'application/json' },
     body: JSON.stringify({ target_path: targetPath }),
   });
+  if (!res.ok) throw new Error('PoW challenge failed');
   const data = await res.json();
   const { challenge, salt, expire_at, difficulty, signature, algorithm, target_path } = data.data.biz_data.challenge;
   const answer = await solvePow(challenge, salt, expire_at, difficulty);
@@ -119,22 +142,18 @@ export async function uploadFile(token, chatSessionId, filePath) {
   form.append('file', fs.createReadStream(filePath), { filename: basename(filePath) });
   const res = await fetch('https://chat.deepseek.com/api/v0/file/upload_file', {
     method: 'POST',
-    headers: { ...form.getHeaders(), ...baseHeaders(token), 'x-ds-pow-response': pow },
+    headers: { ...form.getHeaders(), ...headers(token), 'x-ds-pow-response': pow },
     body: form,
   });
   try { return await res.json(); } catch { return null; }
 }
 
-/**
- * Асинхронный генератор структурированных чанков:
- * { type: 'thinking'|'text'|'searching'|'finished'|'error', content?: string, message_id?: number }
- */
 export async function* completion(token, prompt, chatSessionId, parentMessageId, options = {}) {
   const { search = true, thinking = false, file_ids = [] } = options;
   const pow = await generatePowHeader(token, chatSessionId, '/api/v0/chat/completion');
   const res = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
     method: 'POST',
-    headers: { ...baseHeaders(token), 'content-type': 'application/json', 'x-ds-pow-response': pow },
+    headers: { ...headers(token), 'content-type': 'application/json', 'x-ds-pow-response': pow },
     body: JSON.stringify({
       chat_session_id: chatSessionId,
       parent_message_id: parentMessageId,
@@ -148,26 +167,24 @@ export async function* completion(token, prompt, chatSessionId, parentMessageId,
   const reader = res.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
-  let streamDone = false;
 
-  while (!streamDone) {
+  while (true) {
     const { value, done } = await reader.read();
-    if (done) { streamDone = true; break; }
+    if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop();
-
     for (const line of lines) {
       if (!line.startsWith('data:')) continue;
       const jsonStr = line.slice(5).trim();
       if (jsonStr === '[DONE]' || jsonStr === '') continue;
       try {
         const obj = JSON.parse(jsonStr);
-        if (obj?.v === 'SEARCHING') { yield { type: 'searching' }; continue; }
-        if (obj?.v === 'FINISHED') { yield { type: 'finished' }; continue; }
-        if (obj?.type === 'thinking') {
+        if (obj.v === 'SEARCHING') { yield { type: 'searching' }; continue; }
+        if (obj.v === 'FINISHED') { yield { type: 'finished' }; continue; }
+        if (obj.type === 'thinking') {
           yield { type: 'thinking', content: obj.v };
-        } else if (obj?.v && typeof obj.v === 'string') {
+        } else if (obj.v && typeof obj.v === 'string') {
           const chunk = { type: 'text', content: obj.v };
           if (obj.message_id) chunk.message_id = obj.message_id;
           yield chunk;
@@ -175,4 +192,12 @@ export async function* completion(token, prompt, chatSessionId, parentMessageId,
       } catch {}
     }
   }
+}
+
+// Сохранение истории сессии в JSON-файл
+export function saveHistoryToFile(messages, sessionTitle) {
+  const sanitized = (sessionTitle || 'session').replace(/[^a-z0-9]/gi, '_');
+  const path = join(process.cwd(), `history_${sanitized}_${Date.now()}.json`);
+  fs.writeFileSync(path, JSON.stringify(messages, null, 2), 'utf-8');
+  return path;
 }
