@@ -1,11 +1,11 @@
 {
-	"name": "deepseek",
+	"name": "deepseek-tui",
 	"version": "2.0.0",
-	"description": "DeepSeek TUI client",
+	"description": "DeepSeek TUI client (refactored)",
 	"type": "module",
 	"scripts": {
-		"start": "node tui.js",
-		"api": "node api.js"
+		"start": "node src/index.js",
+		"api": "node src/api/core.js"
 	},
 	"dependencies": {
 		"blessed": "^0.1.81",
