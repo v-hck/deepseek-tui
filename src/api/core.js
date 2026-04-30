@@ -1,14 +1,16 @@
 import fs from "fs";
+import { mkdir, writeFile } from "fs/promises";
 import { Buffer } from "buffer";
 import { fileURLToPath } from "url";
 import { basename, dirname, join } from "path";
 import FormData from "form-data";
-import { logToFile } from "../utils/logger.js";
+import path from "path";
+import os from "os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const wasmPath = join(__dirname, "../../deepseek.wasm"); // был ./deepseek.wasm
+const wasmPath = join(__dirname, "../../deepseek.wasm");
 if (!fs.existsSync(wasmPath)) {
-	logToFile("❌ deepseek.wasm not found at", wasmPath);
+	console.log("❌ deepseek.wasm not found at", wasmPath);
 	process.exit(1);
 }
 const wasmBytes = fs.readFileSync(wasmPath);
@@ -140,6 +142,7 @@ export async function fetchHistoryMessages(token, sessionId) {
 		{ headers: headers(token) },
 	);
 	try {
+		// console.error(await res.text());
 		return await res.json();
 	} catch {
 		return null;
@@ -227,20 +230,21 @@ export async function uploadFile(token, chatSessionId, filePath) {
 	}
 }
 
+// api/core.js
 export async function* completion(
 	token,
 	prompt,
-	chatSessionId,
-	parentMessageId,
+	sessionId,
+	parentIdx,
 	options = {},
 ) {
-	const { search = true, thinking = false, file_ids = [] } = options;
 	const pow = await generatePowHeader(
 		token,
-		chatSessionId,
+		sessionId,
 		"/api/v0/chat/completion",
 	);
-	const res = await fetch(
+
+	const response = await fetch(
 		"https://chat.deepseek.com/api/v0/chat/completion",
 		{
 			method: "POST",
@@ -250,20 +254,24 @@ export async function* completion(
 				"x-ds-pow-response": pow,
 			},
 			body: JSON.stringify({
-				chat_session_id: chatSessionId,
-				parent_message_id: parentMessageId,
+				chat_session_id: sessionId,
+				parent_message_id: parentIdx,
 				model_type: "expert",
 				prompt: prompt,
-				ref_file_ids: file_ids,
-				thinking_enabled: thinking,
-				search_enabled: search,
+				ref_file_ids: options.file_ids,
+				thinking_enabled: options.thinking,
+				search_enabled: options.search,
 			}),
 		},
 	);
 
-	const reader = res.body.getReader();
+	const reader = response.body.getReader();
 	const decoder = new TextDecoder("utf-8");
 	let buffer = "";
+	let currentThinking = "";
+	let currentText = "";
+	let inThinking = false; // внутри фрагмента THINK?
+	let inResponse = false;
 
 	while (true) {
 		const { value, done } = await reader.read();
@@ -277,29 +285,86 @@ export async function* completion(
 			if (jsonStr === "[DONE]" || jsonStr === "") continue;
 			try {
 				const obj = JSON.parse(jsonStr);
-				if (obj.v === "SEARCHING") {
+
+				// Обработка патчей (формат DeepSeek)
+				if (obj.p && obj.v !== undefined) {
+					const path = obj.p;
+					const op = obj.o || "SET";
+
+					// Фрагмент THINK
+					if (
+						path === "response/fragments" && op === "APPEND" &&
+						Array.isArray(obj.v)
+					) {
+						for (const frag of obj.v) {
+							console.error(frag.type, frag, obj.v, obj);
+							if (frag.type === "THINK") {
+								if (!inThinking && currentThinking === "") {
+									inThinking = true;
+									yield { type: "thinking_start" };
+								}
+								currentThinking = frag.content || "";
+								yield {
+									type: "thinking",
+									content: frag.content || "",
+								};
+							} else if (frag.type === "RESPONSE") {
+								if (inThinking) {
+									inThinking = false;
+									yield { type: "thinking_end" };
+								}
+								if (!inResponse) {
+									inResponse = true;
+									yield { type: "text_start" };
+								}
+								currentText = frag.content || "";
+								yield {
+									type: "text",
+									content: frag.content || "",
+								};
+							}
+						}
+					} // APPEND к content существующего фрагмента
+					else if (path.match(/\/content$/) && op === "APPEND") {
+						if (inThinking) {
+							currentThinking += obj.v;
+							yield { type: "thinking", content: obj.v };
+						} else if (inResponse) {
+							currentText += obj.v;
+							yield { type: "text", content: obj.v };
+						}
+					}
+					// SET elapsed_secs — игнорируем
+				} // Обработка старых простых форматов
+				else if (obj.v === "SEARCHING") {
 					yield { type: "searching" };
-					continue;
-				}
-				if (obj.v === "FINISHED") {
-					yield { type: "finished" };
-					continue;
-				}
-				if (obj.type === "thinking") {
+				} else if (obj.v === "FINISHED") {
+					if (inThinking) yield { type: "thinking_end" };
+					if (inResponse) yield { type: "text_end" };
+					yield { type: "finished", message_id: obj.message_id };
+				} else if (obj.type === "thinking") {
 					yield { type: "thinking", content: obj.v };
 				} else if (obj.v && typeof obj.v === "string") {
-					const chunk = { type: "text", content: obj.v };
-					if (obj.message_id) chunk.message_id = obj.message_id;
-					yield chunk;
+					yield { type: "text", content: obj.v };
 				}
-			} catch {}
+				if (obj.message_id) {
+					// последний чанк может нести message_id
+					yield { type: "message_id", message_id: obj.message_id };
+				}
+			} catch (e) {
+				// ignore parse errors
+			}
 		}
 	}
 }
 
-export function saveHistoryToFile(messages, sessionTitle) {
-	const sanitized = (sessionTitle || "session").replace(/[^a-z0-9]/gi, "_");
-	const path = join(process.cwd(), `history_${sanitized}_${Date.now()}.json`);
-	fs.writeFileSync(path, JSON.stringify(messages, null, 2), "utf-8");
-	return path;
+export async function saveHistoryToFile(messages, title) {
+  const dir = path.join(os.homedir(), ".local", "state", "deepseek-tui");
+  await mkdir(dir, { recursive: true });
+  const sanitized = title.replace(/[^a-z0-9]/gi, "_").slice(0, 50);
+  const timestamp = Date.now();
+  const filename = `${timestamp}_${sanitized}.json`;
+  const filePath = path.join(dir, filename);
+  await writeFile(filePath, JSON.stringify(messages, null, 2));
+  return filePath;
 }
