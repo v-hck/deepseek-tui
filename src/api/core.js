@@ -265,6 +265,7 @@ export async function* completion(
 		},
 	);
 
+	console.error(parentIdx)
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder("utf-8");
 	let buffer = "";
@@ -297,7 +298,7 @@ export async function* completion(
 						Array.isArray(obj.v)
 					) {
 						for (const frag of obj.v) {
-							console.error(frag.type, frag, obj.v, obj);
+							// console.error(frag.type, frag, obj.v, obj);
 							if (frag.type === "THINK") {
 								if (!inThinking && currentThinking === "") {
 									inThinking = true;

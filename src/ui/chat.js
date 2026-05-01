@@ -215,7 +215,7 @@ async function sendMessage(prompt, options = {}) {
 			process.env.DEEPSEEK_TOKEN,
 			prompt,
 			state.currentSessionId,
-			assistantIdx - 1,
+			effectiveParentId,
 			{
 				search: state.searchEnabled,
 				thinking: state.thinkingEnabled,
